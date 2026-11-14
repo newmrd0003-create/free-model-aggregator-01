@@ -386,12 +386,13 @@ async function serve(req: IncomingMessage, res: ServerResponse, clientApi: 'open
   const cands = candidatesFor(requires, clientApi, jsonMode);
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : (cands[0]?.model.id ?? 'auto');
   const tried = new Set<string>();
+  const retried = new Set<string>();
   let lastStatus = 503;
   let lastDetail = 'no free model on the directory meets this request';
-  for (;;) {
-    const cand = pickNext(cands, tried);
-    if (cand === null) break;
-    tried.add(`${cand.probe.provider.id}:${cand.model.id}`);
+
+  // One attempt at a candidate: call it, read the answer, translate it. Returns the translated answer
+  // on success, or null (with lastStatus/lastDetail set) on any failure.
+  const attempt = async (cand: Candidate): Promise<{ contentType: string; text: string } | null> => {
     let upstream: Response;
     try {
       upstream = await callProvider(cand, clientApi, body);
@@ -399,21 +400,38 @@ async function serve(req: IncomingMessage, res: ServerResponse, clientApi: 'open
       log(`upstream ${cand.probe.provider.id} unreachable: ${(err as Error).message}`);
       lastStatus = 502;
       lastDetail = `the provider ${cand.probe.provider.id} is unreachable`;
-      continue;
+      return null;
     }
     usedCalls.set(cand.probe.provider.id, callsUsed(cand.probe.provider.id) + 1);
     const text = await upstream.text();
     if (!upstream.ok) {
       lastStatus = upstream.status;
       lastDetail = `the provider ${cand.probe.provider.id} answered HTTP ${upstream.status}`;
-      continue;
+      return null;
     }
     const translated = await translate(cand, clientApi, body, text, requestedModel);
     if (translated === null) {
       lastStatus = 502;
       lastDetail = `the provider ${cand.probe.provider.id} answered unparseable ${body.stream === true ? 'events' : 'JSON'}`;
-      continue;
+      return null;
     }
+    return translated;
+  };
+
+  for (;;) {
+    const cand = pickNext(cands, tried);
+    if (cand === null) break;
+    const key = `${cand.probe.provider.id}:${cand.model.id}`;
+    tried.add(key);
+    let translated = await attempt(cand);
+    if (translated === null && !retried.has(key)) {
+      // A refusal can be a single failing call number: retry the same candidate once before failing
+      // over, so a transient failure does not cost the request its best-rated model. Only once per
+      // candidate per request; a second failure fails over to the next candidate.
+      retried.add(key);
+      translated = await attempt(cand);
+    }
+    if (translated === null) continue;
     res.writeHead(200, { 'content-type': translated.contentType, 'cache-control': 'no-cache' });
     res.end(translated.text);
     return;
