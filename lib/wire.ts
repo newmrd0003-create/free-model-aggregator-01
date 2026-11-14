@@ -1,20 +1,19 @@
-// The client wires and the one upstream wire this baseline speaks.
+// The client wires and the upstream wires this entry speaks.
 //
 // The trial's client calls the entry as an OpenAI service (POST /v1/chat/completions) or an Anthropic one
-// (POST /v1/messages), with a JSON body or with server-sent events. This baseline forwards both to a
-// provider on the openai wire and translates back:
+// (POST /v1/messages), with a JSON body or with server-sent events. The entry forwards both to a provider
+// on any of the three upstream wires (openai, anthropic, gemini) and translates back:
 //
-//   - the OpenAI path passes the client's body (with the routed model's id) to the provider and streams
-//     the provider's JSON or SSE straight back, the way an OpenAI-compatible gateway does;
+//   - the OpenAI path passes the client's body (with the routed model's id) to an openai provider and
+//     streams the provider's JSON or SSE straight back, the way an OpenAI-compatible gateway does;
 //   - the Anthropic path rewrites the request to Chat Completions (system prompt, image blocks, tool
 //     definitions, tool results and tool choice included) and rewrites the provider's answer into a
 //     Messages object, or into the message_start / content_block_start / content_block_delta /
 //     content_block_stop / message_delta / message_stop event order, with the stop reason and the usage
 //     translated. Tool calls become tool_use blocks and input_json_delta events.
-//
-// The gemini and anthropic upstream wires are not implemented in this baseline (main.ts answers 501 for a
-// provider on either): a real entry needs their request and event shapes too, which is the biggest single
-// gap in this starter.
+//   - the Gemini path rewrites either client body into a generateContent request (systemInstruction,
+//     contents, functionDeclarations, generationConfig) and rewrites the candidate answer into either
+//     client shape, JSON or SSE, with usageMetadata carried through exactly.
 //
 // Everything here is a pure function of its arguments: no clock and no randomness, so the same body and the
 // same provider answer give the same bytes on a replay. The two model listings use fixed timestamps for the
@@ -400,4 +399,579 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     for (const event of startEvents()) yield event;
     for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
   }
+}
+
+// The gemini and anthropic upstream wires are implemented below (main.ts no longer answers 501 for them):
+// request builders for every client->provider wire pair, response translators for every provider->client
+// pair, and SSE translators for the streamed pairs. Every translator is a pure function of its arguments:
+// no clock, no randomness, fixed created timestamps, so a replay produces the same bytes.
+
+/** One Anthropic content block as a Gemini part: text, inline image, or tool use/result. */
+function geminiPartsFromAnthropicContent(content: unknown): Json[] {
+  const parts: Json[] = [];
+  if (typeof content === 'string') {
+    if (content !== '') parts.push({ text: content });
+    return parts;
+  }
+  if (!Array.isArray(content)) return parts;
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'text' && typeof block.text === 'string') parts.push({ text: block.text });
+    else if (block.type === 'image' && isRecord(block.source)) {
+      const s = block.source;
+      if (s.type === 'base64' && typeof s.data === 'string') {
+        parts.push({ inlineData: { mimeType: typeof s.media_type === 'string' ? s.media_type : 'image/png', data: s.data } });
+      } else if (s.type === 'url' && typeof s.url === 'string') parts.push({ fileData: { fileUri: s.url } });
+    } else if (block.type === 'tool_use') {
+      parts.push({ functionCall: { name: typeof block.name === 'string' ? block.name : '', args: isRecord(block.input) ? block.input : {} } });
+    } else if (block.type === 'tool_result') {
+      parts.push({
+        functionResponse: {
+          name: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
+          response: { result: toolResultText(block.content) },
+        },
+      });
+    }
+  }
+  return parts;
+}
+
+/** One OpenAI content part as a Gemini part: text or an inline image (data URL kept byte-identical). */
+function geminiPartsFromOpenAIContent(content: unknown): Json[] {
+  const parts: Json[] = [];
+  if (typeof content === 'string') {
+    if (content !== '') parts.push({ text: content });
+    return parts;
+  }
+  if (!Array.isArray(content)) return parts;
+  for (const part of content) {
+    if (!isRecord(part)) continue;
+    if (part.type === 'text' && typeof part.text === 'string') parts.push({ text: part.text });
+    else if (part.type === 'image_url' && isRecord(part.image_url) && typeof part.image_url.url === 'string') {
+      const url = part.image_url.url;
+      const m = /^data:([^;]+);base64,(.*)$/.exec(url);
+      if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
+      else parts.push({ fileData: { fileUri: url } });
+    }
+  }
+  return parts;
+}
+
+/** OpenAI function tools as Gemini functionDeclarations. */
+function geminiToolsFromOpenAI(tools: unknown): Json[] {
+  if (!Array.isArray(tools)) return [];
+  const decls = tools.flatMap((raw) => {
+    if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') return [];
+    return [
+      {
+        name: raw.function.name,
+        description: typeof raw.function.description === 'string' ? raw.function.description : '',
+        parameters: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+      },
+    ];
+  });
+  return decls.length > 0 ? [{ functionDeclarations: decls }] : [];
+}
+
+/** Anthropic tools as Gemini functionDeclarations. */
+function geminiToolsFromAnthropic(tools: unknown): Json[] {
+  if (!Array.isArray(tools)) return [];
+  const decls = tools.flatMap((raw) => {
+    if (!isRecord(raw) || typeof raw.name !== 'string') return [];
+    return [
+      {
+        name: raw.name,
+        description: typeof raw.description === 'string' ? raw.description : '',
+        parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+      },
+    ];
+  });
+  return decls.length > 0 ? [{ functionDeclarations: decls }] : [];
+}
+
+/** A Chat Completions request as an Anthropic Messages request naming `model`. */
+export function openAIToAnthropicRequest(body: Json, model: string): Json {
+  const messages: Json[] = [];
+  let system = '';
+  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+    if (!isRecord(raw)) continue;
+    if (raw.role === 'system') {
+      const t = textOf(raw.content);
+      if (t !== '') system = system === '' ? t : `${system}\n${t}`;
+      continue;
+    }
+    if (raw.role === 'assistant') {
+      const content: Json[] = [];
+      const text = textOf(raw.content);
+      if (text !== '') content.push({ type: 'text', text });
+      for (const call of Array.isArray(raw.tool_calls) ? raw.tool_calls : []) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        content.push({
+          type: 'tool_use',
+          id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
+          name: typeof call.function.name === 'string' ? call.function.name : '',
+          input: argumentsOf(call.function.arguments),
+        });
+      }
+      if (content.length > 0) messages.push({ role: 'assistant', content });
+      continue;
+    }
+    if (raw.role === 'tool') {
+      messages.push({
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : '',
+            content: typeof raw.content === 'string' ? raw.content : toolResultText(raw.content),
+          },
+        ],
+      });
+      continue;
+    }
+    const parts: Json[] = [];
+    const content = raw.content;
+    if (typeof content === 'string') {
+      if (content !== '') parts.push({ type: 'text', text: content });
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!isRecord(part)) continue;
+        if (part.type === 'text' && typeof part.text === 'string') parts.push({ type: 'text', text: part.text });
+        else if (part.type === 'image_url' && isRecord(part.image_url) && typeof part.image_url.url === 'string') {
+          const url = part.image_url.url;
+          const m = /^data:([^;]+);base64,(.*)$/.exec(url);
+          if (m) parts.push({ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } });
+          else parts.push({ type: 'image', source: { type: 'url', url } });
+        }
+      }
+    }
+    if (parts.length > 0) messages.push({ role: 'user', content: parts });
+  }
+  const out: Json = { model, messages };
+  if (system !== '') out.system = system;
+  const maxTok =
+    typeof body.max_tokens === 'number'
+      ? body.max_tokens
+      : typeof body.max_completion_tokens === 'number'
+        ? body.max_completion_tokens
+        : undefined;
+  if (typeof maxTok === 'number') out.max_tokens = maxTok;
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.top_p === 'number') out.top_p = body.top_p;
+  if (Array.isArray(body.stop) && body.stop.length > 0) out.stop_sequences = body.stop;
+  if (Array.isArray(body.tools)) {
+    const tools = body.tools.flatMap((raw) => {
+      if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') return [];
+      return [
+        {
+          name: raw.function.name,
+          description: typeof raw.function.description === 'string' ? raw.function.description : '',
+          input_schema: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+        },
+      ];
+    });
+    if (tools.length > 0) out.tools = tools;
+  }
+  const choice = body.tool_choice;
+  if (choice === 'auto') out.tool_choice = { type: 'auto' };
+  else if (choice === 'required') out.tool_choice = { type: 'any' };
+  else if (isRecord(choice) && choice.type === 'function' && isRecord(choice.function) && typeof choice.function.name === 'string') {
+    out.tool_choice = { type: 'tool', name: choice.function.name };
+  }
+  if (body.stream === true) out.stream = true;
+  return out;
+}
+
+/** A Chat Completions request as a Gemini generateContent request (model goes in the URL, not the body). */
+export function openAIToGeminiRequest(body: Json): Json {
+  const systemParts: Json[] = [];
+  const contents: Json[] = [];
+  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+    if (!isRecord(raw)) continue;
+    if (raw.role === 'system') {
+      systemParts.push(...geminiPartsFromOpenAIContent(raw.content));
+      continue;
+    }
+    if (raw.role === 'assistant') {
+      const parts = geminiPartsFromOpenAIContent(raw.content);
+      for (const call of Array.isArray(raw.tool_calls) ? raw.tool_calls : []) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        parts.push({
+          functionCall: { name: typeof call.function.name === 'string' ? call.function.name : '', args: argumentsOf(call.function.arguments) },
+        });
+      }
+      if (parts.length > 0) contents.push({ role: 'model', parts });
+      continue;
+    }
+    if (raw.role === 'tool') {
+      contents.push({
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : '',
+              response: { result: typeof raw.content === 'string' ? raw.content : toolResultText(raw.content) },
+            },
+          },
+        ],
+      });
+      continue;
+    }
+    const parts = geminiPartsFromOpenAIContent(raw.content);
+    if (parts.length > 0) contents.push({ role: 'user', parts });
+  }
+  const out: Json = { contents };
+  if (systemParts.length > 0) out.systemInstruction = { parts: systemParts };
+  const tools = geminiToolsFromOpenAI(body.tools);
+  if (tools.length > 0) out.tools = tools;
+  const gc: Json = {};
+  const maxTok =
+    typeof body.max_tokens === 'number'
+      ? body.max_tokens
+      : typeof body.max_completion_tokens === 'number'
+        ? body.max_completion_tokens
+        : undefined;
+  if (typeof maxTok === 'number') gc.maxOutputTokens = maxTok;
+  if (typeof body.temperature === 'number') gc.temperature = body.temperature;
+  if (typeof body.top_p === 'number') gc.topP = body.top_p;
+  if (Array.isArray(body.stop) && body.stop.length > 0) gc.stopSequences = body.stop;
+  if (isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema')) {
+    gc.responseMimeType = 'application/json';
+  }
+  if (Object.keys(gc).length > 0) out.generationConfig = gc;
+  return out;
+}
+
+/** An Anthropic Messages request as a Gemini generateContent request (model goes in the URL). */
+export function anthropicToGeminiRequest(body: Json): Json {
+  const systemParts = geminiPartsFromAnthropicContent(body.system);
+  const contents: Json[] = [];
+  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+    if (!isRecord(raw)) continue;
+    const parts = geminiPartsFromAnthropicContent(raw.content);
+    if (parts.length === 0) continue;
+    contents.push({ role: raw.role === 'assistant' ? 'model' : 'user', parts });
+  }
+  const out: Json = { contents };
+  if (systemParts.length > 0) out.systemInstruction = { parts: systemParts };
+  const tools = geminiToolsFromAnthropic(body.tools);
+  if (tools.length > 0) out.tools = tools;
+  const gc: Json = {};
+  if (typeof body.max_tokens === 'number') gc.maxOutputTokens = body.max_tokens;
+  if (typeof body.temperature === 'number') gc.temperature = body.temperature;
+  if (typeof body.top_p === 'number') gc.topP = body.top_p;
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) gc.stopSequences = body.stop_sequences;
+  if (Object.keys(gc).length > 0) out.generationConfig = gc;
+  return out;
+}
+
+/** The first candidate of a Gemini response, or null. */
+function geminiCandidate(g: Json): Json | null {
+  const cands = Array.isArray(g.candidates) ? g.candidates : [];
+  return isRecord(cands[0]) ? cands[0] : null;
+}
+
+/** A Gemini candidate's text parts joined. */
+function geminiTextOfCandidate(cand: Json | null): string {
+  if (cand === null) return '';
+  const content = isRecord(cand.content) ? cand.content : {};
+  const parts = Array.isArray(content.parts) ? content.parts : [];
+  return parts.flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : [])).join('');
+}
+
+/** A Gemini response's usage as input/output token counts. */
+function geminiUsageOf(g: Json): { input: number; output: number } {
+  const u = isRecord(g.usageMetadata) ? g.usageMetadata : {};
+  return { input: numberOrZero(u.promptTokenCount), output: numberOrZero(u.candidatesTokenCount) };
+}
+
+/** Gemini's finishReason as OpenAI's finish_reason. */
+function geminiStopToOpenAI(finish: unknown): string {
+  if (finish === 'MAX_TOKENS') return 'length';
+  if (finish === 'SAFETY') return 'content_filter';
+  return 'stop';
+}
+
+/** Gemini's finishReason as Anthropic's stop_reason. */
+function geminiStopToAnthropic(finish: unknown): string {
+  if (finish === 'MAX_TOKENS') return 'max_tokens';
+  if (finish === 'SAFETY') return 'refusal';
+  return 'end_turn';
+}
+
+/** Anthropic's stop_reason as OpenAI's finish_reason. */
+function anthropicStopToOpenAI(stop: unknown): string {
+  if (stop === 'max_tokens') return 'length';
+  if (stop === 'tool_use') return 'tool_calls';
+  if (stop === 'refusal') return 'content_filter';
+  return 'stop';
+}
+
+/** A Gemini answer as a Chat Completions object naming `model`. */
+export function geminiToOpenAIResponse(g: Json, model: string): Json {
+  const cand = geminiCandidate(g);
+  const text = geminiTextOfCandidate(cand);
+  const usage = geminiUsageOf(g);
+  const toolCalls: Json[] = [];
+  const content = cand !== null && isRecord(cand.content) ? cand.content : {};
+  const parts = Array.isArray(content.parts) ? content.parts : [];
+  parts.forEach((p, i) => {
+    if (!isRecord(p) || !isRecord(p.functionCall)) return;
+    toolCalls.push({
+      id: `call_${i}`,
+      type: 'function',
+      function: {
+        name: typeof p.functionCall.name === 'string' ? p.functionCall.name : '',
+        arguments: JSON.stringify(isRecord(p.functionCall.args) ? p.functionCall.args : {}),
+      },
+    });
+  });
+  return {
+    id: 'chatcmpl-aggregate',
+    object: 'chat.completion',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: text, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) },
+        finish_reason: geminiStopToOpenAI(cand !== null ? cand.finishReason : undefined),
+      },
+    ],
+    usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output },
+  };
+}
+
+/** A Gemini answer as an Anthropic Messages object naming `model`. */
+export function geminiToAnthropicResponse(g: Json, model: string): Json {
+  const cand = geminiCandidate(g);
+  const text = geminiTextOfCandidate(cand);
+  const usage = geminiUsageOf(g);
+  const content: Json[] = [];
+  if (text !== '') content.push({ type: 'text', text });
+  const inner = cand !== null && isRecord(cand.content) ? cand.content : {};
+  const parts = Array.isArray(inner.parts) ? inner.parts : [];
+  parts.forEach((p, i) => {
+    if (!isRecord(p) || !isRecord(p.functionCall)) return;
+    content.push({
+      type: 'tool_use',
+      id: `toolu_${i}`,
+      name: typeof p.functionCall.name === 'string' ? p.functionCall.name : '',
+      input: isRecord(p.functionCall.args) ? p.functionCall.args : {},
+    });
+  });
+  if (content.length === 0) content.push({ type: 'text', text: '' });
+  return {
+    id: `msg_${model}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: geminiStopToAnthropic(cand !== null ? cand.finishReason : undefined),
+    stop_sequence: null,
+    usage: { input_tokens: usage.input, output_tokens: usage.output },
+  };
+}
+
+/** An Anthropic Messages answer as a Chat Completions object naming `model`. */
+export function anthropicToOpenAIResponse(a: Json, model: string): Json {
+  const blocks = Array.isArray(a.content) ? a.content : [];
+  const text = blocks.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('');
+  const toolCalls: Json[] = [];
+  for (const b of blocks) {
+    if (!isRecord(b) || b.type !== 'tool_use') continue;
+    toolCalls.push({
+      id: typeof b.id === 'string' ? b.id : 'toolu_unknown',
+      type: 'function',
+      function: { name: typeof b.name === 'string' ? b.name : '', arguments: JSON.stringify(isRecord(b.input) ? b.input : {}) },
+    });
+  }
+  const usage = isRecord(a.usage) ? a.usage : {};
+  const input = numberOrZero(usage.input_tokens);
+  const output = numberOrZero(usage.output_tokens);
+  return {
+    id: 'chatcmpl-aggregate',
+    object: 'chat.completion',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: text, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) },
+        finish_reason: anthropicStopToOpenAI(a.stop_reason),
+      },
+    ],
+    usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output },
+  };
+}
+
+/** One SSE stream's frames as {event, data} pairs; `data:` lines are joined per frame. */
+function parseSseFrames(text: string): { event: string | null; data: string }[] {
+  const frames: { event: string | null; data: string }[] = [];
+  for (const raw of text.replace(/\r\n/g, '\n').split('\n\n')) {
+    if (raw.trim() === '') continue;
+    let event: string | null = null;
+    const datas: string[] = [];
+    for (const line of raw.split('\n')) {
+      const t = line.trim();
+      if (t.startsWith('event:')) event = t.slice(6).trim();
+      else if (t.startsWith('data:')) datas.push(t.slice(5).trim());
+    }
+    for (const d of datas) frames.push({ event, data: d });
+  }
+  return frames;
+}
+
+/** One Chat Completions chunk frame. */
+function openAIChunk(model: string, delta: Json, finish: string | null): string {
+  return `data: ${JSON.stringify({
+    id: 'chatcmpl-aggregate',
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  })}\n\n`;
+}
+
+/** A full answer (text, stop, usage) as a Chat Completions SSE stream ending in [DONE]. */
+function openAIStreamOf(model: string, text: string, stop: string, input: number, output: number, toolCalls: Json[]): string {
+  let out = openAIChunk(model, { role: 'assistant' }, null);
+  if (text !== '') out += openAIChunk(model, { content: text }, null);
+  for (const call of toolCalls) out += openAIChunk(model, { tool_calls: [call] }, null);
+  out += openAIChunk(model, {}, stop);
+  out += `data: ${JSON.stringify({
+    id: 'chatcmpl-aggregate',
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [],
+    usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output },
+  })}\n\n`;
+  out += 'data: [DONE]\n\n';
+  return out;
+}
+
+/** An Anthropic SSE stream as a Chat Completions SSE stream. */
+export function anthropicEventsToOpenAI(sseText: string, model: string): string {
+  let text = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop = 'stop';
+  const toolBlocks = new Map<number, { id: string; name: string; args: string }>();
+  for (const f of parseSseFrames(sseText)) {
+    if (f.data === '[DONE]') continue;
+    let ev: unknown;
+    try {
+      ev = JSON.parse(f.data);
+    } catch {
+      continue;
+    }
+    if (!isRecord(ev)) continue;
+    if (ev.type === 'message_start' && isRecord(ev.message) && isRecord(ev.message.usage)) {
+      inputTokens = numberOrZero(ev.message.usage.input_tokens);
+    } else if (ev.type === 'content_block_start' && isRecord(ev.content_block) && ev.content_block.type === 'tool_use') {
+      const index = typeof ev.index === 'number' ? ev.index : toolBlocks.size;
+      toolBlocks.set(index, {
+        id: typeof ev.content_block.id === 'string' ? ev.content_block.id : `toolu_${index}`,
+        name: typeof ev.content_block.name === 'string' ? ev.content_block.name : '',
+        args: '',
+      });
+    } else if (ev.type === 'content_block_delta' && isRecord(ev.delta)) {
+      if (ev.delta.type === 'text_delta' && typeof ev.delta.text === 'string') text += ev.delta.text;
+      else if (ev.delta.type === 'input_json_delta' && typeof ev.delta.partial_json === 'string') {
+        const index = typeof ev.index === 'number' ? ev.index : 0;
+        const block = toolBlocks.get(index);
+        if (block) block.args += ev.delta.partial_json;
+      }
+    } else if (ev.type === 'message_delta') {
+      if (isRecord(ev.delta) && typeof ev.delta.stop_reason === 'string') stop = anthropicStopToOpenAI(ev.delta.stop_reason);
+      if (isRecord(ev.usage)) outputTokens = numberOrZero(ev.usage.output_tokens);
+    }
+  }
+  const toolCalls: Json[] = [...toolBlocks.entries()].map(([index, b]) => ({
+    index,
+    id: b.id,
+    type: 'function',
+    function: { name: b.name, arguments: b.args },
+  }));
+  return openAIStreamOf(model, text, stop, inputTokens, outputTokens, toolCalls);
+}
+
+/** A Gemini SSE stream as a Chat Completions SSE stream. */
+export function geminiEventsToOpenAI(sseText: string, model: string): string {
+  let text = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop = 'stop';
+  for (const f of parseSseFrames(sseText)) {
+    if (f.data === '[DONE]') continue;
+    let frame: unknown;
+    try {
+      frame = JSON.parse(f.data);
+    } catch {
+      continue;
+    }
+    if (!isRecord(frame)) continue;
+    const cand = geminiCandidate(frame);
+    text += geminiTextOfCandidate(cand);
+    if (cand !== null && typeof cand.finishReason === 'string') stop = geminiStopToOpenAI(cand.finishReason);
+    if (isRecord(frame.usageMetadata)) {
+      const u = geminiUsageOf(frame);
+      inputTokens = u.input;
+      outputTokens = u.output;
+    }
+  }
+  return openAIStreamOf(model, text, stop, inputTokens, outputTokens, []);
+}
+
+/** A Gemini SSE stream as the Anthropic event sequence. */
+export function geminiEventsToAnthropic(sseText: string, model: string): string {
+  let text = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop = 'end_turn';
+  for (const f of parseSseFrames(sseText)) {
+    if (f.data === '[DONE]') continue;
+    let frame: unknown;
+    try {
+      frame = JSON.parse(f.data);
+    } catch {
+      continue;
+    }
+    if (!isRecord(frame)) continue;
+    const cand = geminiCandidate(frame);
+    text += geminiTextOfCandidate(cand);
+    if (cand !== null && typeof cand.finishReason === 'string') stop = geminiStopToAnthropic(cand.finishReason);
+    if (isRecord(frame.usageMetadata)) {
+      const u = geminiUsageOf(frame);
+      inputTokens = u.input;
+      outputTokens = u.output;
+    }
+  }
+  let out = '';
+  out += sseEvent('message_start', {
+    type: 'message_start',
+    message: {
+      id: `msg_${model}`,
+      type: 'message',
+      role: 'assistant',
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: inputTokens, output_tokens: 0 },
+    },
+  });
+  out += sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  if (text !== '') {
+    out += sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
+  }
+  out += sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+  out += sseEvent('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: stop, stop_sequence: null },
+    usage: { output_tokens: outputTokens },
+  });
+  out += sseEvent('message_stop', { type: 'message_stop' });
+  return out;
 }

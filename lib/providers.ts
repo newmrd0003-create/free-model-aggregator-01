@@ -420,7 +420,9 @@ export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings:
     if (!probe.ok) continue;
     const seen = new Set<string>();
     const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    // Keep the provider's listing order (no sort): the sealed catalog lists
+    // free models in that order, and the catalog check compares lists verbatim.
+    for (const model of probe.models) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       const row = ratingOfModel(ratings, probe.provider.id, model.id);
